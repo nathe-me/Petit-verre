@@ -1,0 +1,82 @@
+name: Require triage unanimous approval
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  require-triage-approvals:
+    name: triage/unanimous
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const pull_number = pr.number;
+            const author = pr.user?.login;
+
+            // 1) Load required approvers (one login per line)
+            const path = '.github/required-triage-approvers.txt';
+            if (!fs.existsSync(path)) {
+              core.setFailed(`Missing ${path}. Create it with one GitHub login per line.`);
+              return;
+            }
+
+            const required = fs.readFileSync(path, 'utf8')
+              .split(/\r?\n/)
+              .map(s => s.trim())
+              .filter(s => s && !s.startsWith('#'))
+              .filter(login => login !== author); // author can't approve own PR
+
+            if (required.length === 0) {
+              console.log('No required approvers (or only the PR author). Passing.');
+              return;
+            }
+
+            // 2) Fetch all reviews
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number, per_page: 100
+            });
+
+            // 3) Compute effective state per reviewer:
+            //    APPROVED sticks unless later CHANGES_REQUESTED or DISMISSED.
+            //    COMMENTED doesn't override.
+            reviews.sort((a,b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+
+            const effective = new Map(); // login -> state
+            for (const r of reviews) {
+              const login = r.user?.login;
+              if (!login) continue;
+              if (r.state === 'COMMENTED') continue;
+              effective.set(login, r.state);
+            }
+
+            const missing = [];
+            for (const login of required) {
+              if (effective.get(login) !== 'APPROVED') {
+                const st = effective.get(login);
+                missing.push(st ? `${login} (${st})` : `${login} (no review)`);
+              }
+            }
+
+            if (missing.length > 0) {
+              core.setFailed(
+                `Need unanimous triage approval. Missing: ${missing.join(', ')}`
+              );
+            } else {
+              console.log(`All required approvers approved: ${required.join(', ')}`);
